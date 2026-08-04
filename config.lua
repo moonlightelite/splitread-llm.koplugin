@@ -7,7 +7,7 @@ local Config = {}
 local config_path = DataStorage:getSettingsDir() .. "/splitread.lua"
 
 local defaults = {
-    api_key = "",
+    provider = "google",
     source_lang = "auto",
     target_lang = "en",
     panel_height_ratio = 0.50,

@@ -28,6 +28,11 @@ local PANEL_SIZES = {
     { ratio = 0.45, name = "Large (45%)" },
 }
 
+local PROVIDERS = {
+    { key = "google", name = "KOReader (Google Translate)", requires_key = false },
+    { key = "gemini", name = "Gemini", requires_key = true },
+}
+
 
 local UI = {}
 
@@ -47,6 +52,45 @@ function UI:getPanelSizeName(ratio)
         end
     end
     return tostring(math.floor(ratio * 100)) .. "%"
+end
+
+function UI:getProviderName(key)
+    for _, p in ipairs(PROVIDERS) do
+        if p.key == key then return p.name end
+    end
+    return key
+end
+
+function UI:showProviderPicker(current_key, on_select, on_done)
+    local provider_dialog
+    local buttons = {}
+
+    table.insert(buttons, {
+        {
+            text = "⚠ Add API keys to keys.lua in the plugin folder",
+            callback = function() end,
+        }
+    })
+
+    for _, p in ipairs(PROVIDERS) do
+        local is_current = p.key == current_key
+        table.insert(buttons, {
+            {
+                text = (is_current and "✓ " or "  ") .. p.name,
+                callback = function()
+                    UIManager:close(provider_dialog)
+                    on_select(p.key)
+                    on_done()
+                end,
+            }
+        })
+    end
+
+    provider_dialog = ButtonDialogTitle:new{
+        title = "Translation Provider",
+        buttons = buttons,
+    }
+    UIManager:show(provider_dialog)
 end
 
 function UI:showLanguagePicker(title, current_code, on_select, on_done)
@@ -151,7 +195,7 @@ function UI:showSettingsDialog(config, Config, on_refresh, on_panel_resize)
             buttons = {
                 {
                     {
-                        text = "Source: " .. self:getLanguageName(config.source_lang),
+                        text = "Source language: " .. self:getLanguageName(config.source_lang),
                         callback = function()
                             UIManager:close(dialog)
                             self:showLanguagePicker(
@@ -170,7 +214,7 @@ function UI:showSettingsDialog(config, Config, on_refresh, on_panel_resize)
                 },
                 {
                     {
-                        text = "Target: " .. self:getLanguageName(config.target_lang),
+                        text = "Target language: " .. self:getLanguageName(config.target_lang),
                         callback = function()
                             UIManager:close(dialog)
                             self:showLanguagePicker(
@@ -198,6 +242,24 @@ function UI:showSettingsDialog(config, Config, on_refresh, on_panel_resize)
                         end,
                     },
                 },
+                {
+    {
+        text = "Provider: " .. self:getProviderName(config.provider or "google"),
+        callback = function()
+            UIManager:close(dialog)
+            self:showProviderPicker(
+                config.provider or "google",
+                function(provider_key)
+                    config.provider = provider_key
+                    Config:save(config)
+                end,
+                function()
+                    self:showSettingsDialog(config, Config, on_refresh, on_panel_resize)
+                end
+            )
+        end,
+    },
+},
                 {
                     {
                         text = "Font size: " .. tostring(config.font_size) .. " pt",

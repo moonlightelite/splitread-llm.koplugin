@@ -22,6 +22,7 @@ local splitread = InputContainer:extend{
     panel_height = 0,
     config = nil,
     is_initialized = false, 
+    translation_cache = {},
 }
 
 function splitread:init()
@@ -37,12 +38,13 @@ function splitread:init()
     self.panel_height = math.floor(Screen:getHeight() * self.config.panel_height_ratio)
 
     local tap_size = Screen:scaleByDPI(60)
+    local tap_margin = Screen:scaleByDPI(16)
     self.ges_events.Tap = {
         GestureRange:new{
             ges = "tap",
             range = Geom:new{
-                x = Screen:getWidth() - tap_size,
-                y = Screen:getHeight() - tap_size,
+                x = Screen:getWidth() - tap_size - tap_margin,
+                y = Screen:getHeight() - tap_size - tap_margin,
                 w = tap_size,
                 h = tap_size,
             },
@@ -248,20 +250,30 @@ function splitread:translateCurrentPage()
         self:refreshPanel()
         return
     end
+    
+    local cache_key = self.ui.document:getCurrentPage()
+    
+    if self.translation_cache[cache_key] then
+    	self.panel_text = self.translation_cache[cache_key]
+	self:refreshPanel()
+	return
+    end
 
     self.panel_text = "Translating..."
     self:refreshPanel()
-
+    
     local translated, err = Translator:translate(
         final_text,
         self.config.source_lang,
-        self.config.target_lang
+        self.config.target_lang,
+        self.config.provider
     )
 
     if err then
         self.panel_text = "Error: " .. err
     else
         self.panel_text = translated or "Empty translation."
+        self.translation_cache[cache_key] = self.panel_text
     end
 
     self:refreshPanel()
@@ -284,7 +296,7 @@ function splitread:getPanelGearRegion()
     local screen_h = Screen:getHeight()
     local footer_h = self:getFooterHeight()
     local icon_size = Screen:scaleByDPI(32)
-    local margin = Screen:scaleByDPI(8)
+    local margin = Screen:scaleByDPI(16)
     return {
         x = screen_w - icon_size - margin,
         y = screen_h - footer_h - icon_size - margin,
