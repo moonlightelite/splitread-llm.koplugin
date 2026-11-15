@@ -23,6 +23,12 @@ local LANGUAGES = {
 
 local FONT_SIZES = {10, 12, 14, 16, 18, 20, 22}
 
+-- How many pages after the current one are translated in the background.
+local PREFETCH_CHOICES = {0, 1, 2, 3, 5, 10}
+
+-- Size limit of the translation cache, in MB (0 = no limit).
+local CACHE_LIMITS = {1, 5, 10, 20, 50, 100, 200, 0}
+
 local PANEL_SIZES = {
     { ratio = 0.25, name = "Small (25%)" },
     { ratio = 0.35, name = "Medium (35%)" },
@@ -51,6 +57,25 @@ function UI:getLanguageName(code)
         end
     end
     return code:upper()
+end
+
+function UI:getPrefetchName(n)
+    n = tonumber(n) or 0
+    if n <= 0 then return "off" end
+    return "next " .. n .. (n == 1 and " page" or " pages")
+end
+
+function UI:getCacheLimitName(mb)
+    mb = tonumber(mb) or 0
+    if mb <= 0 then return "no limit" end
+    return string.format("%g MB", mb)
+end
+
+local function formatBytes(bytes)
+    if bytes < 1024 then return string.format("%d B", bytes) end
+    if bytes < 10 * 1024 then return string.format("%.1f KB", bytes / 1024) end
+    if bytes < 1024 * 1024 then return string.format("%.0f KB", bytes / 1024) end
+    return string.format("%.1f MB", bytes / (1024 * 1024))
 end
 
 function UI:getPanelSizeName(ratio)
@@ -359,6 +384,191 @@ function UI:showLocalSettingsDialog(config, Config, on_done)
     UIManager:show(dialog)
 end
 
+function UI:showPrefetchPicker(current, on_select, on_done)
+    local picker
+    local buttons = {
+        { { text = "Pages after the current one are translated in the background.", callback = function() end } },
+        { { text = "Needs auto-translate. Each page is one request.", callback = function() end } },
+    }
+    for _, n in ipairs(PREFETCH_CHOICES) do
+        table.insert(buttons, {
+            {
+                text = (n == current and "✓ " or "  ") .. (n == 0 and "Off" or self:getPrefetchName(n)),
+                callback = function()
+                    UIManager:close(picker)
+                    on_select(n)
+                    on_done()
+                end,
+            },
+        })
+    end
+    picker = ButtonDialogTitle:new{
+        title = "Pre-translate ahead",
+        buttons = buttons,
+        tap_close_callback = on_done,
+    }
+    UIManager:show(picker)
+end
+
+function UI:showCacheLimitPicker(current_mb, on_select, on_done)
+    local picker
+    local buttons = {
+        { { text = "When the limit is reached, the least recently used translations are removed.", callback = function() end } },
+    }
+    for _, mb in ipairs(CACHE_LIMITS) do
+        table.insert(buttons, {
+            {
+                text = (mb == current_mb and "✓ " or "  ") .. (mb == 0 and "No limit" or self:getCacheLimitName(mb)),
+                callback = function()
+                    UIManager:close(picker)
+                    on_select(mb)
+                    on_done()
+                end,
+            },
+        })
+    end
+    picker = ButtonDialogTitle:new{
+        title = "Cache size limit (all books together)",
+        buttons = buttons,
+        tap_close_callback = on_done,
+    }
+    UIManager:show(picker)
+end
+
+-- Deletes saved translations after asking: scope "book" = this book in every
+-- language, "all" = the cache of every book. `cache` is the open book's cache;
+-- `on_done` runs afterwards (also when the user cancels).
+function UI:confirmClear(scope, cache, on_done)
+    local ConfirmBox = require("ui/widget/confirmbox")
+    local InfoMessage = require("ui/widget/infomessage")
+    local TranslationCache = require("translation_cache")
+    local function say(text)
+        UIManager:show(InfoMessage:new{ text = text, timeout = 4, dismiss_callback = on_done })
+    end
+    local function plural(n, one, many) return n == 1 and one or many end
+
+    if scope == "all" then
+        local st = TranslationCache.stats()
+        if st.files == 0 then
+            say("The translation cache is already empty.")
+            return
+        end
+        UIManager:show(ConfirmBox:new{
+            text = string.format("Delete all saved translations of every book?\n\n%d language %s in %d %s, %s.\nThis cannot be undone.",
+                st.files, plural(st.files, "file", "files"), st.books, plural(st.books, "book", "books"), formatBytes(st.bytes)),
+            ok_text = "Delete all",
+            ok_callback = function()
+                local removed = TranslationCache.clearAll(cache)
+                say(string.format("Cache cleared: %d %s deleted (%s).", removed, plural(removed, "file", "files"), formatBytes(st.bytes)))
+            end,
+            cancel_callback = on_done,
+        })
+    else
+        local n = cache:count()
+        if n == 0 then
+            say("Nothing is saved for this book.")
+            return
+        end
+        UIManager:show(ConfirmBox:new{
+            text = string.format("Delete the %d saved %s of this book, in every language?\n\nThis cannot be undone.",
+                n, plural(n, "translation", "translations")),
+            ok_text = "Delete",
+            ok_callback = function()
+                local removed = cache:clear()
+                say(string.format("%d saved %s deleted.", removed, plural(removed, "translation", "translations")))
+            end,
+            cancel_callback = on_done,
+        })
+    end
+end
+
+-- What is saved for the open book, per target language, with buttons to clear
+-- one language, the whole book, or every book. `cache` is the book's
+-- TranslationCache.
+function UI:showCacheDialog(cache, on_done, config, Config)
+    local TranslationCache = require("translation_cache")
+    local dialog
+    local buttons = {}
+    local function reopen() self:showCacheDialog(cache, on_done, config, Config) end
+    local function add(text, action)
+        table.insert(buttons, {
+            {
+                text = text,
+                callback = function()
+                    UIManager:close(dialog)
+                    if action then action() end
+                    reopen()
+                end,
+            },
+        })
+    end
+
+    if config and Config then
+        table.insert(buttons, {
+            {
+                text = string.format("Size limit: %s (%s used, all books)", self:getCacheLimitName(config.cache_max_mb),
+                    formatBytes(TranslationCache.totalBytes())),
+                callback = function()
+                    UIManager:close(dialog)
+                    self:showCacheLimitPicker(config.cache_max_mb, function(mb)
+                        config.cache_max_mb = mb
+                        Config:save(config)
+                        cache:setMaxMB(mb)
+                        cache:enforceLimit()     -- a lower limit takes effect at once
+                    end, reopen)
+                end,
+            },
+        })
+    end
+
+    local counts = cache:countsByLanguage()
+    local codes = {}
+    for code in pairs(counts) do table.insert(codes, code) end
+    local function label(code) return code == "" and "unknown language" or self:getLanguageName(code) end
+    table.sort(codes, function(a, b) return label(a) < label(b) end)
+
+    if #codes == 0 then
+        add("Nothing saved for this book yet")
+    end
+    for _, code in ipairs(codes) do
+        add(string.format("Clear %s (%d pages)", label(code), counts[code]), function()
+            cache:clearLanguage(code)
+        end)
+    end
+    -- (these two ask first)
+    local function add_confirmed(text, scope)
+        table.insert(buttons, {
+            {
+                text = text,
+                callback = function()
+                    UIManager:close(dialog)
+                    self:confirmClear(scope, cache, reopen)
+                end,
+            },
+        })
+    end
+    if cache:count() > 0 then
+        add_confirmed(string.format("Clear this book (%d pages)…", cache:count()), "book")
+    end
+    add_confirmed("Clear the cache of every book…", "all")
+    table.insert(buttons, {
+        {
+            text = "Back",
+            callback = function()
+                UIManager:close(dialog)
+                on_done()
+            end,
+        },
+    })
+
+    dialog = ButtonDialogTitle:new{
+        title = "Translation cache (each target language is kept separately)",
+        buttons = buttons,
+        tap_close_callback = on_done,
+    }
+    UIManager:show(dialog)
+end
+
 function UI:showProviderPicker(current_key, on_select, on_done)
     local provider_dialog
     local buttons = {}
@@ -551,6 +761,24 @@ function UI:showSettingsDialog(config, Config, on_refresh, on_panel_resize, on_t
                     },
                 },
                 {
+                    {
+                        text = "Pre-translate: " .. self:getPrefetchName(config.prefetch_pages),
+                        callback = function()
+                            UIManager:close(dialog)
+                            self:showPrefetchPicker(
+                                tonumber(config.prefetch_pages) or 0,
+                                function(n)
+                                    config.prefetch_pages = n
+                                    Config:save(config)
+                                end,
+                                function()
+                                    self:showSettingsDialog(config, Config, on_refresh, on_panel_resize, on_translate)
+                                end
+                            )
+                        end,
+                    },
+                },
+                {
     {
         text = "Provider: " .. self:getProviderName(config.provider or "google"),
         callback = function()
@@ -599,6 +827,18 @@ function UI:showSettingsDialog(config, Config, on_refresh, on_panel_resize, on_t
                 },
                 {
                     {
+                        text = "Translation cache: " .. (self.translation_cache and self.translation_cache:count() or 0) .. " pages saved",
+                        callback = function()
+                            if not self.translation_cache then return end
+                            UIManager:close(dialog)
+                            self:showCacheDialog(self.translation_cache, function()
+                                self:showSettingsDialog(config, Config, on_refresh, on_panel_resize, on_translate)
+                            end, config, Config)
+                        end,
+                    },
+                },
+                {
+                    {
                         text = "Font size: " .. tostring(config.font_size) .. " pt",
                         callback = function()
                             UIManager:close(dialog)
@@ -642,11 +882,19 @@ function UI:showSettingsDialog(config, Config, on_refresh, on_panel_resize, on_t
                         callback = function()
                             UIManager:close(dialog)
                             self.current_dialog = nil
-                            
+                            -- Tell the plugin the settings are done: it repaints the
+                            -- panel and re-translates if the language, provider,
+                            -- model or prompt changed.
+                            if on_refresh then on_refresh() end
                         end,
                     },
                 },
             },
+            -- Tapping outside the dialog closes it too.
+            tap_close_callback = function()
+                self.current_dialog = nil
+                if on_refresh then on_refresh() end
+            end,
         }
         self.current_dialog = dialog
         UIManager:show(dialog)

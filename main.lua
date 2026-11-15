@@ -14,6 +14,8 @@ local Geom = require("ui/geometry")
 local Config = require("config")
 local Translator = require("translator")
 local UI = require("ui_splitread")
+local TranslationCache = require("translation_cache")
+local Sentences = require("sentences")
 
 local splitread = InputContainer:extend{
     name = "splitread",
@@ -22,7 +24,6 @@ local splitread = InputContainer:extend{
     panel_height = 0,
     config = nil,
     is_initialized = false, 
-    translation_cache = {},
 }
 
 function splitread:init()
@@ -36,11 +37,13 @@ function splitread:init()
     end
     self.panel_height = math.floor(Screen:getHeight() * self.config.panel_height_ratio)
 
-    -- Per instance (a table on the class would be shared by every book opened
-    -- in this session, showing book A's translation on book B's page).
-    self.translation_cache = {}
+    -- The translation cache of the open book, loaded on first use
+    -- (see getTranslationCache). Per instance, never shared between books.
+    self.tcache = nil
     -- One stable function, so a pending run can be unscheduled when the user
     -- flips pages quickly (a request to a local LLM can take a while).
+    self.prefetch_task = function() self:prefetchStep() end
+    self.prefetch_poll_task = function() self:prefetchPoll() end
     self.translate_task = function()
         -- The book may have been disabled while this was pending.
         if self:isEnabledForBook() then self:translateCurrentPage() end
@@ -202,134 +205,145 @@ function splitread:getTextForPage(page)
     return self:flattenText(text)
 end
 
--- Byte position of the first capital letter: A-Z, or Latin-1 À-Þ (two bytes,
--- 0xC3 0x80-0x9E, minus the multiplication sign). Do not use a Lua set such as
--- [A-ZÄÖÜ] for this: a set matches single bytes, and bytes like 0x9C also sit
--- inside other characters (the last byte of “). Cutting the text there leaves
--- invalid UTF-8, which vLLM rejects with HTTP 400 "error parsing the body".
-local function findFirstCapital(s)
-    local first = s:find("[A-Z]")
-    local from = 1
-    while true do
-        local p = s:find("\195[\128-\158]", from)
-        if not p then break end
-        if s:byte(p + 1) ~= 0x97 then
-            if not first or p < first then first = p end
-            break
-        end
-        from = p + 2
-    end
-    return first
-end
+-- How far a sentence is followed across page breaks (characters of text).
+local PREV_TAIL_MAX = 500        -- start of a sentence that began on the previous page
+local READ_AHEAD_MAX = 900       -- end of a sentence that continues on the next pages
+local READ_AHEAD_PAGES = 3       -- ... but never further than this many pages
 
--- Joins the unfinished sentence at the end of the previous page and the start
--- of the next one onto the current page, so every sentence is translated whole.
+-- Text for the translation of `current_page`, whose own text is `current`.
+-- A sentence cut in two by a page break is translated whole:
+--   * when the page ends in the middle of a sentence, the rest of it is read from
+--     the following page(s), up to the real end of the sentence;
+--   * when the page begins with the end of a sentence that started on the
+--     previous page, the beginning of that sentence is put in front.
+-- Where a sentence ends is decided by sentences.lua (it knows full-width CJK
+-- marks, closing quotes, abbreviations, ...).
 function splitread:stitchPageText(current_page, current)
+    current = current:gsub("^%s+", ""):gsub("%s+$", "")
+
     local prev_tail = ""
     if current_page > 1 then
         local prev = self:getTextForPage(current_page - 1)
         if prev and #prev > 0 then
-            local last_dot = 0
-            for i = #prev, 1, -1 do
-                local c = prev:sub(i, i)
-                if c == "." or c == "!" or c == "?" then
-                    last_dot = i
-                    break
-                end
-            end
-            if last_dot > 0 and last_dot < #prev then
-                prev_tail = prev:sub(last_dot + 1):gsub("^%s+", "")
-            end
+            prev_tail = Sentences.limit(Sentences.unfinishedTail(prev, current), PREV_TAIL_MAX, true)
         end
     end
 
     local next_head = ""
     local next_text = self:getTextForPage(current_page + 1)
-    if next_text and #next_text > 0 then
-        local first_dot = 0
-        for i = 1, #next_text do
-            local c = next_text:sub(i, i)
-            if c == "." or c == "!" or c == "?" then
-                first_dot = i
+    if Sentences.unfinishedTail(current, next_text) ~= "" then
+        -- The page ends mid-sentence: read on until the sentence is complete.
+        local ahead = ""
+        local page = current_page + 1
+        local text = next_text
+        for _ = 1, READ_AHEAD_PAGES do
+            if not text or #text == 0 then break end
+            ahead = (ahead == "" and "" or (ahead .. " ")) .. text
+            local following = self:getTextForPage(page + 1)
+            local sentence = Sentences.firstSentence(ahead, following)
+            if sentence then
+                next_head = sentence
                 break
             end
+            if #ahead >= READ_AHEAD_MAX then break end
+            page = page + 1
+            text = following
         end
-        if first_dot > 0 then
-            next_head = next_text:sub(1, first_dot)
+        if next_head == "" and ahead ~= "" then
+            -- No sentence end in sight (a very long sentence, or a page without
+            -- punctuation): take what there is, up to the limit.
+            next_head = ahead
         end
-    end
-
-    local first_cap = findFirstCapital(current)
-    local clean_current = current
-    if first_cap and first_cap > 1 then
-        local incomplete_start = current:sub(1, first_cap - 1):gsub("^%s+", "")
-        clean_current = current:sub(first_cap)
-        if #prev_tail > 0 then
-            prev_tail = prev_tail .. incomplete_start
-        end
-    else
-        prev_tail = ""
-    end
-
-    local last_dot = 0
-    for i = #clean_current, 1, -1 do
-        local c = clean_current:sub(i, i)
-        if c == "." or c == "!" or c == "?" then
-            last_dot = i
-            break
-        end
-    end
-
-    local incomplete_end = ""
-    if last_dot > 0 and last_dot < #clean_current then
-        incomplete_end = clean_current:sub(last_dot + 1):gsub("^%s+", "")
-        clean_current = clean_current:sub(1, last_dot)
+        next_head = Sentences.limit(next_head, READ_AHEAD_MAX)
     end
 
     local parts = {}
-    if #prev_tail > 0 then table.insert(parts, prev_tail) end
-    if #clean_current > 0 then table.insert(parts, clean_current) end
-    if #incomplete_end > 0 and #next_head > 0 then
-        table.insert(parts, incomplete_end .. next_head)
-    elseif #incomplete_end > 0 then
-        table.insert(parts, incomplete_end)
-    end
-
-    local final_text = table.concat(parts, " ")
-    return final_text
+    if prev_tail ~= "" then table.insert(parts, prev_tail) end
+    if current ~= "" then table.insert(parts, current) end
+    if next_head ~= "" then table.insert(parts, next_head) end
+    return table.concat(parts, " ")
 end
 
 -- A page counts as "has text" when it holds at least this many non-space chars.
 local MIN_TEXT_CHARS = 8
 local IMAGE_JPEG_QUALITY = 85
 
--- Key for the translation cache. Everything that changes the result is part of
--- it, so editing the language, provider or system prompt never shows a stale one.
-function splitread:getCacheKey(page, kind)
+local KEY_SEP = "\31"
+
+-- The cache of the open book (translation_cache.lua): kept on disk, so it
+-- survives closing the book. Falls back to a memory-only cache if the file
+-- cannot be used.
+function splitread:getTranslationCache()
+    if not self.tcache then
+        local file = self.ui and self.ui.document and self.ui.document.file
+        local ok, cache = pcall(TranslationCache.open, file, self.config.cache_max_mb)
+        if not ok or not cache then
+            logger.warn("splitread: translation cache unavailable:", tostring(cache))
+            cache = TranslationCache.open(nil, self.config.cache_max_mb)
+        end
+        self.tcache = cache
+    end
+    self.tcache:setMaxMB(self.config.cache_max_mb)   -- the limit may have been changed in the settings
+    return self.tcache
+end
+
+-- First part of every cache key: everything about the settings that changes the
+-- result. The TARGET language is in it, so a page translated into Simplified
+-- Chinese and into Traditional Chinese are two separate entries (and so are
+-- two providers, two source languages, two local models or system prompts).
+function splitread:getCachePrefix(kind)
     local c = self.config
     local provider = c.provider or "google"
-    local parts = { self:getBookKey() or "", provider, c.source_lang, c.target_lang, kind, page }
+    local parts = { kind, provider, tostring(c.source_lang), tostring(c.target_lang) }
     if provider == "local" then
-        table.insert(parts, c.local_url)
-        table.insert(parts, c.local_model)
-        table.insert(parts, c.local_system_prompt)
-        table.insert(parts, c.image_max_side)
+        -- Without a configured model the server picks one: tell servers apart then.
+        local model = c.local_model or ""
+        if model == "" then model = "auto@" .. tostring(c.local_url) end
+        table.insert(parts, TranslationCache.hash(model .. "\0" .. tostring(c.local_system_prompt)))
     end
-    for i, v in ipairs(parts) do parts[i] = tostring(v) end
-    return table.concat(parts, "\31")
+    return table.concat(parts, KEY_SEP)
+end
+
+-- Text translations are keyed by the text itself, not by the page number:
+-- changing the font size or the panel size re-flows an EPUB, and "page 5" is
+-- then different text.
+function splitread:getTextCacheKey(text)
+    return self:getCachePrefix("t") .. KEY_SEP .. TranslationCache.hash(text)
+end
+
+-- Page images have no text to key on. A PDF/CBZ page keeps its number; the size
+-- of the reading area is part of the key because it decides what the picture
+-- shows for an EPUB.
+function splitread:getImageCacheKey(page)
+    local dimen = self.ui.dimen or {}
+    return table.concat({
+        self:getCachePrefix("i"), tostring(page),
+        tostring(dimen.w) .. "x" .. tostring(dimen.h), tostring(self.config.image_max_side),
+    }, KEY_SEP)
 end
 
 -- Shows the cached translation for `key`, if any. Returns true when it did.
+-- `force` ("Translate this page now") ignores the cache; the new result then
+-- replaces the old entry.
 function splitread:showCachedTranslation(key, force)
-    if force then
-        self.translation_cache[key] = nil
-        return false
-    end
-    local cached = self.translation_cache[key]
+    if force then return false end
+    local cached = self:getTranslationCache():get(self.config.target_lang, key)
     if not cached then return false end
     self.panel_text = cached
     self:refreshPanel()
+    self:schedulePrefetch()
     return true
+end
+
+-- False (after telling the user in the panel) when there is no connection to
+-- the translation service.
+function splitread:hasConnection()
+    if Translator:isNetworkAvailable(self.config.provider or "google", self.config.local_url) then
+        return true
+    end
+    self.panel_text = "No internet connection."
+    self:refreshPanel()
+    return false
 end
 
 -- Sends `text` or `image` to the configured provider and shows the result.
@@ -352,9 +366,12 @@ function splitread:runTranslation(key, text, image)
 
     if err then
         self.panel_text = "Error: " .. err
+    elseif translated and translated ~= "" then
+        self.panel_text = translated
+        self:getTranslationCache():put(self.config.target_lang, key, translated)
+        self:schedulePrefetch()
     else
-        self.panel_text = translated or "Empty translation."
-        self.translation_cache[key] = self.panel_text
+        self.panel_text = "Empty translation."
     end
 
     self:refreshPanel()
@@ -425,21 +442,16 @@ function splitread:getPageImage(page)
 end
 
 -- `force` skips the cache (used by "Translate this page now").
-function splitread:translateCurrentPage(force)
+-- Decides what has to be translated for `page`: its (stitched) text or its
+-- image. Returns a plan { kind = "text"|"image", page =, key =, text = }, or nil
+-- and the message to show instead.
+function splitread:planPage(page)
     local provider = self.config.provider or "google"
     local mode = self.config.page_input or "auto"
 
-    if not Translator:isNetworkAvailable(provider, self.config.local_url) then
-        self.panel_text = "No internet connection."
-        self:refreshPanel()
-        return
-    end
-
-    local current_page = self.ui:getCurrentPage()
-
     local current
     if mode ~= "image" then
-        current = self:getTextForPage(current_page)
+        current = self:getTextForPage(page)
     end
 
     -- Page image (OCR) instead of page text: always in "image" mode, and in
@@ -451,41 +463,227 @@ function splitread:translateCurrentPage(force)
 
     if use_image then
         if provider ~= "local" then
-            self.panel_text = "Page images can only be read by the Local LLM provider. "
+            return nil, "Page images can only be read by the Local LLM provider. "
                 .. "Choose it in Settings > Provider."
-            self:refreshPanel()
-            return
         end
-        local key = self:getCacheKey(current_page, "image")
-        if self:showCachedTranslation(key, force) then return end
+        return { kind = "image", page = page, key = self:getImageCacheKey(page) }
+    end
+
+    if not current or #current == 0 then
+        return nil, "No text found. (Image-only pages can be read by the Local LLM provider.)"
+    end
+
+    local final_text = self:stitchPageText(page, current)
+    if #final_text == 0 then
+        return nil, "No complete sentences found."
+    end
+    return { kind = "text", page = page, text = final_text, key = self:getTextCacheKey(final_text) }
+end
+
+-- `force` skips the cache (used by "Translate this page now").
+function splitread:translateCurrentPage(force)
+    local page = self.ui:getCurrentPage()
+    local plan, message = self:planPage(page)
+    if not plan then
+        self.panel_text = message
+        self:refreshPanel()
+        return
+    end
+
+    -- A cached translation needs no connection: the network is only checked
+    -- once a request has to be made.
+    if self:showCachedTranslation(plan.key, force) then return end
+    -- The page is being translated in the background already: wait for that.
+    if not force and self:waitForPrefetch(plan.key) then return end
+    if not self:hasConnection() then return end
+
+    if plan.kind == "image" then
         self.panel_text = "Preparing the page image..."
         self:refreshPanel()
-        local image, err = self:getPageImage(current_page)
+        local image, err = self:getPageImage(page)
         if not image then
             self.panel_text = "Error: " .. tostring(err)
             self:refreshPanel()
             return
         end
-        self:runTranslation(key, nil, image)
+        self:runTranslation(plan.key, nil, image)
+    else
+        self:runTranslation(plan.key, plan.text, nil)
+    end
+end
+
+------------------------------------------------------------------------------
+-- Pre-translation: the next pages are translated in the background, so that
+-- turning the page finds the translation in the cache.
+--
+-- The request runs in a separate process (ffi/util.runInSubProcess), so the
+-- reader stays responsive however long the server takes (a local model may need
+-- a minute per page). One page at a time; the answer comes back through a pipe,
+-- is polled for, and goes into the cache.
+------------------------------------------------------------------------------
+
+local PREFETCH_DELAY = 1.0          -- seconds after a translation before the next page is started
+local PREFETCH_POLL = 0.4           -- how often a running request is checked on
+local PREFETCH_PAUSE = 60           -- seconds without trying again after a failure
+local PREFETCH_MAX_PAYLOAD = 48 * 1024   -- stays below the 64 KB buffer of a pipe
+
+function splitread:getPrefetchCount()
+    local n = tonumber(self.config.prefetch_pages) or 0
+    return math.max(0, math.min(math.floor(n), 20))
+end
+
+function splitread:getLastPage()
+    local ok, n = pcall(function()
+        local doc = self.ui.document
+        return doc.getPageCount and doc:getPageCount()
+    end)
+    return ok and tonumber(n) or nil
+end
+
+-- (Re)starts the countdown to the next background translation.
+function splitread:schedulePrefetch()
+    UIManager:unschedule(self.prefetch_task)
+    if self.closed or self:getPrefetchCount() == 0 or not self.config.auto_translate then return end
+    UIManager:scheduleIn(PREFETCH_DELAY, self.prefetch_task)
+end
+
+-- Starts the translation of the first page ahead that is not in the cache yet.
+function splitread:prefetchStep()
+    if self.closed or self.prefetch_job then return end
+    local count = self:getPrefetchCount()
+    if count == 0 or not self.config.auto_translate or not self:isEnabledForBook() then return end
+
+    local pause = (self.prefetch_pause_until or 0) - os.time()
+    if pause > 0 then
+        UIManager:scheduleIn(pause + 1, self.prefetch_task)
+        return
+    end
+    if not Translator:isNetworkAvailable(self.config.provider or "google", self.config.local_url) then return end
+
+    local cache = self:getTranslationCache()
+    local lang = self.config.target_lang
+    local first = self.ui:getCurrentPage()
+    local last = self:getLastPage() or math.huge
+    for page = first + 1, math.min(first + count, last) do
+        local plan = self:planPage(page)
+        -- (the picture of a page is only available for PDF/CBZ/DjVu; an EPUB page
+        -- cannot be rendered while it is not on the screen)
+        if plan and (plan.kind == "text" or self.ui.paging) and not cache:get(lang, plan.key) then
+            self:startPrefetchJob(plan)
+            return
+        end
+    end
+end
+
+function splitread:startPrefetchJob(plan)
+    local image
+    if plan.kind == "image" then
+        local img, err = self:getPageImage(plan.page)
+        if not img then
+            logger.warn("splitread: pre-translation: no page image:", tostring(err))
+            self.prefetch_pause_until = os.time() + PREFETCH_PAUSE
+            return
+        end
+        image = img
+    end
+
+    local cfg = self.config
+    local source, target, provider = cfg.source_lang, cfg.target_lang, cfg.provider
+    local opts = {
+        config = cfg,
+        image = image,
+        source_name = UI:getLanguageName(source),
+        target_name = UI:getLanguageName(target),
+    }
+    local ffiutil = require("ffi/util")
+    local pid, fd = ffiutil.runInSubProcess(function(_, write_fd)
+        local ok, translated, err = pcall(Translator.translate, Translator, plan.text, source, target, provider, opts)
+        local payload
+        if ok and type(translated) == "string" and translated ~= "" then
+            payload = "OK\n" .. translated
+        else
+            payload = "ERR\n" .. tostring(ok and err or translated)
+        end
+        ffiutil.writeToFD(write_fd, payload:sub(1, PREFETCH_MAX_PAYLOAD), true)
+    end, true)
+    if not pid then
+        logger.warn("splitread: pre-translation: could not start a process:", tostring(fd))
+        self.prefetch_pause_until = os.time() + PREFETCH_PAUSE
         return
     end
 
-    if not current or #current == 0 then
-        self.panel_text = "No text found. (Image-only pages can be read by the Local LLM provider.)"
-        self:refreshPanel()
+    local timeout = tonumber(cfg.local_timeout) or 180
+    self.prefetch_job = { pid = pid, fd = fd, key = plan.key, lang = target, page = plan.page, deadline = os.time() + timeout + 20 }
+    logger.info("splitread: pre-translating page", plan.page)
+    UIManager:scheduleIn(PREFETCH_POLL, self.prefetch_poll_task)
+end
+
+-- Checks on the running request; stores the answer in the cache when it is done.
+function splitread:prefetchPoll()
+    local job = self.prefetch_job
+    if not job then return end
+    local ffiutil = require("ffi/util")
+    if not job.killed and os.time() > job.deadline then
+        ffiutil.terminateSubProcess(job.pid)
+        job.killed = true
+    end
+    if not ffiutil.isSubProcessDone(job.pid) then
+        UIManager:scheduleIn(PREFETCH_POLL, self.prefetch_poll_task)
         return
     end
 
-    local final_text = self:stitchPageText(current_page, current)
-    if #final_text == 0 then
-        self.panel_text = "No complete sentences found."
-        self:refreshPanel()
-        return
-    end
+    local data = ffiutil.readAllFromFD(job.fd)
+    self.prefetch_job = nil
+    if self.closed or job.killed then return end   -- stopped on purpose: drop the answer
 
-    local key = self:getCacheKey(current_page, "text")
-    if self:showCachedTranslation(key, force) then return end
-    self:runTranslation(key, final_text, nil)
+    local status, body = (data or ""):match("^(%u+)\n(.*)$")
+    if status == "OK" and body and body ~= "" then
+        -- stored under the language it was asked for, even if the setting changed meanwhile
+        self:getTranslationCache():put(job.lang, job.key, body)
+        if self.waiting_key == job.key then
+            self.waiting_key = nil
+            self.panel_text = body
+            self:refreshPanel()
+        end
+        self:schedulePrefetch()
+    else
+        logger.warn("splitread: pre-translation failed:", status == "ERR" and body or "no answer")
+        self.prefetch_pause_until = os.time() + PREFETCH_PAUSE
+        if self.waiting_key == job.key then
+            -- the user is waiting for this page: ask again in the foreground,
+            -- which also shows the error
+            self.waiting_key = nil
+            self:translateCurrentPage()
+        end
+    end
+end
+
+-- When the page the user turned to is being translated right now, show
+-- "Translating..." and let the poll deliver the result. Returns true when it does.
+function splitread:waitForPrefetch(key)
+    local job = self.prefetch_job
+    if not job or job.key ~= key or job.killed then return false end
+    self.waiting_key = key
+    self.panel_text = "Translating..."
+    self:refreshPanel()
+    return true
+end
+
+-- Stops pre-translating (book closed or disabled). A running request is killed;
+-- the poll keeps going until the process is gone, so that it is collected.
+function splitread:cancelPrefetch()
+    UIManager:unschedule(self.prefetch_task)
+    self.waiting_key = nil
+    local job = self.prefetch_job
+    if job and not job.killed then
+        pcall(function() require("ffi/util").terminateSubProcess(job.pid) end)
+        job.killed = true
+    end
+end
+
+function splitread:onCloseDocument()
+    self.closed = true
+    self:cancelPrefetch()
 end
 
 function splitread:scheduleTranslation()
@@ -519,13 +717,39 @@ function splitread:getPanelGearRegion()
     }
 end
 
+-- Changes whenever a setting that alters the translation changes (the page
+-- itself aside): language, provider, model, system prompt, page input.
+function splitread:getSettingsSignature()
+    return table.concat({ self:getCachePrefix("t"), tostring(self.config.page_input),
+        tostring(self.config.image_max_side) }, KEY_SEP)
+end
+
 function splitread:showSettingsDialog()
     if not self.config then
         self.config = Config:load()
     end
+    local signature = self:getSettingsSignature()
+    UI.translation_cache = self:getTranslationCache()   -- for "Translation cache..."
     UI:showSettingsDialog(self.config, Config,
         function()
+            -- The settings were closed.
             self:refreshPanel()
+            self:schedulePrefetch()   -- the number of pages ahead may have changed
+            local now = self:getSettingsSignature()
+            if now == signature then return end
+            signature = now
+            -- The panel still shows a translation made with the old settings
+            -- (e.g. Simplified Chinese after switching to Traditional).
+            if self.config.auto_translate then
+                UIManager:scheduleIn(0.3, function()
+                    if self:isEnabledForBook() then self:translateCurrentPage() end
+                end)
+            else
+                -- No request without being asked, but do not keep showing a
+                -- translation that no longer matches the settings.
+                self.panel_text = "Settings changed. Open Settings > Translate this page now."
+                self:refreshPanel()
+            end
         end,
         function(new_ratio)
         end,
@@ -600,6 +824,7 @@ function splitread:addToMainMenu(menu_items)
                         self:onReaderReady()       
                     else
                         -- disabling — restore viewport
+                        self:cancelPrefetch()
                         self.view.dimen.h = Screen:getHeight()
                         self.ui.dimen.h = Screen:getHeight()
                         self.ui:handleEvent(Event:new("SetDimensions", self.ui.dimen))
@@ -618,6 +843,14 @@ function splitread:addToMainMenu(menu_items)
                 text = "Settings",
                 callback = function()
                     self:showSettingsDialog()
+                end,
+            },
+            {
+                text = "Clear all translation cache...",
+                callback = function()
+                    -- a background request would only refill it
+                    self:cancelPrefetch()
+                    UI:confirmClear("all", self:getTranslationCache(), function() self:schedulePrefetch() end)
                 end,
             },
         },

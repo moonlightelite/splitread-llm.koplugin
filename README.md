@@ -60,9 +60,11 @@ While splitread is enabled, tap the **⚙** icon in the bottom-right corner of t
 - **Source language** - language of the book (default: Auto detect)
 - **Target language** - language to translate into (default: English). Chinese comes in two entries, **Chinese (Simplified)** and **Chinese (Traditional)**, so you get the script you want. A setting saved as plain "Chinese" by an older version is read as Simplified.
 - **Auto-translate** - toggle automatic translation on page turns
+- **Pre-translate** - translate the next 1, 2, 3, 5 or 10 pages in the background, so that turning the page finds the translation ready (default: off). See [Pre-translation](#pre-translation).
 - **Provider** - allows you to switch between translation providers: Google Translate, Gemini, or a Local LLM. (To learn how to obtain a Gemini Translation API key, see the section further down this page)
 - **Page input** - what is sent for translation: the page text, the page image (OCR), or **Auto** (text, falling back to the image when a page has no text). Images are only supported by the Local LLM provider.
 - **Local LLM settings** - server URL and port, model, and system prompt for the Local LLM provider.
+- **Translation cache** - what is saved for this book, per language, and the size limit. See [Translation cache](#translation-cache).
 - **Translate this page now** - (re)translate the current page, bypassing the cache.
 - **Font size** - adjust the translation panel font size
 
@@ -71,6 +73,28 @@ Settings are saved globally across all books.
 ### Disabling for a book
 
 Go back to the same **NAVIGATION** menu -> **splitread** -> **Disable for this book**. The screen returns to normal.
+
+### Translation cache
+
+Every translation is saved on disk as soon as it arrives, so a page is never translated twice, also not after closing the book or restarting KOReader, and cached pages are shown without a network connection.
+
+- **Per book and per language.** The cache lives in `splitread_cache/` in the KOReader folder: one folder per book, and in it one file per target language (`zh-CN.jsonl`, `zh-TW.jsonl`, `en.jsonl`, ...). A page translated into Simplified and into Traditional Chinese is two separate entries, and so are translations by different providers, from different source languages, or by different local models or system prompts. Only the file of the language you are reading is loaded.
+- **Keyed by the text.** A translation is found again by the text that was translated, not by its page number, so changing the font size (which re-flows an EPUB) never shows the translation of another page. Go back to the old font size and the old translations are found again.
+- **Size limit.** The cache of all books together may take at most **20 MB** (change it under **Translation cache > Size limit**: 1, 5, 10, 20, 50, 100, 200 MB, or no limit; `cache_max_mb` in `settings/splitread.lua`). When a save pushes it over the limit, the oldest-used data is removed automatically, down to 90% of the limit: first the language files of other books and languages that were used least recently, and only then the oldest entries of the language you are reading (an entry you read counts as new). Lowering the limit takes effect at once.
+- **Clearing.** **Translation cache** lists the languages saved for this book with their page counts; each can be cleared on its own, or the whole book, or the cache of every book (these last two ask for confirmation first and tell you how much they will delete). **Clear all translation cache...** in the splitread menu (NAVIGATION menu -> **splitread**) deletes the cache of every book without opening the settings. **Translate this page now** ignores the cache and replaces the entry.
+
+### Pre-translation
+
+With **Pre-translate** set to 1-10 pages (and **Auto-translate** on), splitread translates the pages after the current one in the background, one at a time, starting a second after the current page is done. The answers go into the cache, so turning the page shows the translation immediately.
+
+- The request runs in a separate process, so the reader stays responsive even if the server needs a minute per page. If you turn to a page that is being translated at that moment, the panel says "Translating..." and shows the text as soon as it arrives.
+- Each pre-translated page is one request to the provider: mind the quota of Gemini, or Google's rate limit. After a failure, pre-translation pauses for a minute.
+- Pages of a PDF/CBZ/DjVu that need the page image (scans) are pre-translated too; an EPUB page that is not on the screen cannot be rendered, so image-only EPUB pages are not.
+- It stops when you close or disable the book, and never goes past the last page.
+
+### Sentences across page breaks
+
+A sentence that is cut in two by a page break is translated whole: when a page ends in the middle of a sentence, the rest of it is read from the following page(s), and when a page begins with the end of a sentence, its beginning is put in front. Sentence ends are recognized for Latin, Cyrillic, Greek, CJK (`。！？`), Arabic, Devanagari and other scripts, including closing quotes (`"Where?" she asked.` is one sentence), ellipses and common abbreviations (`Mr.`, `J. R. R.`, `z. B.`).
 
 ### Using a local LLM
 
@@ -161,10 +185,10 @@ The Gemini translation provider is now ready to use.
 
 ## Known Limitations
 
-- The first and last lines of each page may be partially cut off at page boundaries - SplitRead stitches sentences across pages to compensate in the translation panel
+- The first and last lines of each page may be partially cut off at page boundaries - SplitRead reads the rest of the sentence from the next page (and the start from the previous one) to compensate in the translation panel. Sentence ends are found heuristically, so an unusual abbreviation can cut a sentence short; the read-ahead is limited to about 900 characters / 3 pages
 - Very large font sizes in the translation panel may cause text to be clipped
-- Requires WiFi/network for every page translation (the Local LLM provider only needs to reach your server)
-- Requests are synchronous: the reader is busy while the translation of a page is being fetched, which can take a while with a local LLM, especially for page images
+- Requires WiFi/network for every page that is not in the cache yet (the Local LLM provider only needs to reach your server)
+- The page you are on is translated in the foreground: the reader is busy while that request runs, which can take a while with a local LLM, especially for page images. Pre-translating the next pages avoids the wait on later pages
 
 ---
 

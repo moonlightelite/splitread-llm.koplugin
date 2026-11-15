@@ -63,6 +63,21 @@ function Translator:translate(text, source_lang, target_lang, provider, opts)
     end
 end
 
+-- Models lean towards Simplified characters whenever they write Chinese, so a
+-- Chinese target also gets an explicit instruction about the script.
+local SCRIPT_NOTES = {
+    ["zh-TW"] = "Write the Chinese in Traditional characters (繁體中文, as used in Taiwan "
+        .. "and Hong Kong), never in Simplified characters.",
+    ["zh-CN"] = "Write the Chinese in Simplified characters (简体中文), never in "
+        .. "Traditional characters.",
+}
+
+-- " <note>" to append to a prompt sentence, or "" when the target needs none.
+local function scriptNote(target_lang)
+    local note = SCRIPT_NOTES[target_lang]
+    return note and (" " .. note) or ""
+end
+
 -- Google wants lower case codes, except the two Chinese ones (zh-CN is
 -- Simplified, zh-TW is Traditional), which keep the case KOReader's own
 -- translator sends.
@@ -107,9 +122,10 @@ function Translator:translateGemini(text, source_lang, target_lang, api_key, opt
     -- which a bare code like "zh-TW" might.
     opts = opts or {}
     local prompt = string.format(
-        "Translate the following text from %s to %s. Return only the translation, nothing else:\n\n%s",
+        "Translate the following text from %s to %s.%s Return only the translation, nothing else:\n\n%s",
         source_lang == "auto" and "the source language" or (opts.source_name or source_lang),
         opts.target_name or target_lang,
+        scriptNote(target_lang),
         text
     )
 
@@ -406,10 +422,10 @@ function Translator:translateLocal(text, source_lang, target_lang, opts)
                 type = "text",
                 text = string.format(
                     "The image is a page from a book. Read all of the text on the page (OCR) "
-                    .. "in natural reading order, then translate it from %s to %s. "
+                    .. "in natural reading order, then translate it from %s to %s.%s "
                     .. "Return only the translation, nothing else. "
                     .. "If the page has no readable text, reply with exactly: [no text]",
-                    source_name, target_name),
+                    source_name, target_name, scriptNote(target_lang)),
             },
             {
                 type = "image_url",
@@ -418,8 +434,8 @@ function Translator:translateLocal(text, source_lang, target_lang, opts)
         }
     else
         user_content = string.format(
-            "Translate the following text from %s to %s. Return only the translation, nothing else:\n\n%s",
-            source_name, target_name, text)
+            "Translate the following text from %s to %s.%s Return only the translation, nothing else:\n\n%s",
+            source_name, target_name, scriptNote(target_lang), text)
     end
 
     local messages = {}
