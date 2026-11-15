@@ -28,14 +28,23 @@ local splitread = InputContainer:extend{
 function splitread:init()
     self.ui.menu:registerToMainMenu(self)
     local ok, config = pcall(function() return Config:load() end)
-    self.config = ok and config or {
-        source_lang = "auto",
-        target_lang = "en",
-        panel_height_ratio = 0.50,
-        auto_translate = true,
-        font_size = 14,
-    }
+    if ok and config then
+        self.config = config
+    else
+        self.config = {}
+        for k, v in pairs(Config.defaults) do self.config[k] = v end
+    end
     self.panel_height = math.floor(Screen:getHeight() * self.config.panel_height_ratio)
+
+    -- Per instance (a table on the class would be shared by every book opened
+    -- in this session, showing book A's translation on book B's page).
+    self.translation_cache = {}
+    -- One stable function, so a pending run can be unscheduled when the user
+    -- flips pages quickly (a request to a local LLM can take a while).
+    self.translate_task = function()
+        -- The book may have been disabled while this was pending.
+        if self:isEnabledForBook() then self:translateCurrentPage() end
+    end
 
     local tap_size = Screen:scaleByDPI(60)
     local tap_margin = Screen:scaleByDPI(16)
@@ -120,17 +129,29 @@ function splitread:shrinkReadingArea()
     local footer_h = self:getFooterHeight()
     local screen_h = Screen:getHeight()
     local new_h = screen_h - self.panel_height - footer_h
+    if self.ui.paging then
+        -- For paged documents (PDF, CBZ, DjVu) ReaderView already subtracts
+        -- the footer from the visible area itself.
+        new_h = new_h + footer_h
+    end
     self.view.dimen.h = new_h
     self.ui.dimen.h = new_h
-    local margins = self.ui.document:getPageMargins()
-    self.ui:handleEvent(Event:new("SetPageMargins", {
-        margins.left,
-        margins.top,
-        margins.right,
-        2,
-    }))
-    logger.info("splitread: set bottom margin to 2")
+    if self.ui.rolling then
+        -- Page margins only exist for reflowable documents (CreDocument).
+        local margins = self.ui.document:getPageMargins()
+        self.ui:handleEvent(Event:new("SetPageMargins", {
+            margins.left,
+            margins.top,
+            margins.right,
+            2,
+        }))
+        logger.info("splitread: set bottom margin to 2")
+    end
     self.ui:handleEvent(Event:new("SetDimensions", self.ui.dimen))
+    if self.ui.paging then
+        -- Re-zoom and redraw the page for the smaller area.
+        self.ui:handleEvent(Event:new("RedrawCurrentPage"))
+    end
 end
 
 function splitread:flattenText(t)
@@ -146,9 +167,33 @@ function splitread:flattenText(t)
     return table.concat(words, " ")
 end
 
+-- Words of a paged document page, as returned by getPageTextBoxes(): a list of
+-- lines, each a list of word boxes ({ word = "...", x0 = ..., ... }).
+function splitread:flattenTextBoxes(boxes)
+    local lines = {}
+    for _, line in ipairs(boxes) do
+        local words = {}
+        if type(line) == "table" then
+            for _, box in ipairs(line) do
+                if type(box) == "table" and box.word then
+                    table.insert(words, box.word)
+                end
+            end
+        end
+        if #words > 0 then
+            table.insert(lines, table.concat(words, " "))
+        end
+    end
+    return table.concat(lines, " ")
+end
+
 function splitread:getTextForPage(page)
     local doc = self.ui.document
     local ok, text = pcall(function()
+        if self.ui.paging then
+            -- PDF/DjVu/CBZ: use the text layer if there is one.
+            return self:flattenTextBoxes(doc:getPageTextBoxes(page) or {})
+        end
         local pos0 = doc:getPageXPointer(page)
         local pos1 = doc:getPageXPointer(page + 1)
         return doc:getTextFromXPointers(pos0, pos1, false)
@@ -157,23 +202,29 @@ function splitread:getTextForPage(page)
     return self:flattenText(text)
 end
 
-function splitread:translateCurrentPage()
-    if not Translator:isNetworkAvailable() then
-        self.panel_text = "No internet connection."
-        self:refreshPanel()
-        return
+-- Byte position of the first capital letter: A-Z, or Latin-1 À-Þ (two bytes,
+-- 0xC3 0x80-0x9E, minus the multiplication sign). Do not use a Lua set such as
+-- [A-ZÄÖÜ] for this: a set matches single bytes, and bytes like 0x9C also sit
+-- inside other characters (the last byte of “). Cutting the text there leaves
+-- invalid UTF-8, which vLLM rejects with HTTP 400 "error parsing the body".
+local function findFirstCapital(s)
+    local first = s:find("[A-Z]")
+    local from = 1
+    while true do
+        local p = s:find("\195[\128-\158]", from)
+        if not p then break end
+        if s:byte(p + 1) ~= 0x97 then
+            if not first or p < first then first = p end
+            break
+        end
+        from = p + 2
     end
+    return first
+end
 
-    local doc = self.ui.document
-    local current_page = doc:getCurrentPage()
-
-    local current = self:getTextForPage(current_page)
-    if not current or #current == 0 then
-        self.panel_text = "No text found."
-        self:refreshPanel()
-        return
-    end
-
+-- Joins the unfinished sentence at the end of the previous page and the start
+-- of the next one onto the current page, so every sentence is translated whole.
+function splitread:stitchPageText(current_page, current)
     local prev_tail = ""
     if current_page > 1 then
         local prev = self:getTextForPage(current_page - 1)
@@ -208,7 +259,7 @@ function splitread:translateCurrentPage()
         end
     end
 
-    local first_cap = current:find("[A-ZÄÖÜ]")
+    local first_cap = findFirstCapital(current)
     local clean_current = current
     if first_cap and first_cap > 1 then
         local incomplete_start = current:sub(1, first_cap - 1):gsub("^%s+", "")
@@ -245,50 +296,213 @@ function splitread:translateCurrentPage()
     end
 
     local final_text = table.concat(parts, " ")
-    if #final_text == 0 then
-        self.panel_text = "No complete sentences found."
-        self:refreshPanel()
-        return
-    end
-    
-    local cache_key = self.ui.document:getCurrentPage()
-    
-    if self.translation_cache[cache_key] then
-    	self.panel_text = self.translation_cache[cache_key]
-	self:refreshPanel()
-	return
-    end
+    return final_text
+end
 
-    self.panel_text = "Translating..."
+-- A page counts as "has text" when it holds at least this many non-space chars.
+local MIN_TEXT_CHARS = 8
+local IMAGE_JPEG_QUALITY = 85
+
+-- Key for the translation cache. Everything that changes the result is part of
+-- it, so editing the language, provider or system prompt never shows a stale one.
+function splitread:getCacheKey(page, kind)
+    local c = self.config
+    local provider = c.provider or "google"
+    local parts = { self:getBookKey() or "", provider, c.source_lang, c.target_lang, kind, page }
+    if provider == "local" then
+        table.insert(parts, c.local_url)
+        table.insert(parts, c.local_model)
+        table.insert(parts, c.local_system_prompt)
+        table.insert(parts, c.image_max_side)
+    end
+    for i, v in ipairs(parts) do parts[i] = tostring(v) end
+    return table.concat(parts, "\31")
+end
+
+-- Shows the cached translation for `key`, if any. Returns true when it did.
+function splitread:showCachedTranslation(key, force)
+    if force then
+        self.translation_cache[key] = nil
+        return false
+    end
+    local cached = self.translation_cache[key]
+    if not cached then return false end
+    self.panel_text = cached
     self:refreshPanel()
-    
+    return true
+end
+
+-- Sends `text` or `image` to the configured provider and shows the result.
+function splitread:runTranslation(key, text, image)
+    self.panel_text = image and "Reading the page image and translating..." or "Translating..."
+    self:refreshPanel()
+
     local translated, err = Translator:translate(
-        final_text,
+        text,
         self.config.source_lang,
         self.config.target_lang,
-        self.config.provider
+        self.config.provider,
+        {
+            config = self.config,
+            image = image,
+            source_name = UI:getLanguageName(self.config.source_lang),
+            target_name = UI:getLanguageName(self.config.target_lang),
+        }
     )
 
     if err then
         self.panel_text = "Error: " .. err
     else
         self.panel_text = translated or "Empty translation."
-        self.translation_cache[cache_key] = self.panel_text
+        self.translation_cache[key] = self.panel_text
     end
 
     self:refreshPanel()
 end
 
+-- The current page as a bitmap: returns a Blitbuffer and whether the caller
+-- owns it (and must free it). Paged documents are rendered at a resolution
+-- suited to OCR; reflowable ones (an EPUB made of images, ...) are cropped
+-- from what is on screen.
+function splitread:capturePageBB(page)
+    if self.ui.paging then
+        local ok, tile = pcall(function()
+            local doc = self.ui.document
+            local native = doc:getNativePageDimensions(page)
+            local max_side = tonumber(self.config.image_max_side) or 1600
+            local zoom = max_side / math.max(native.w, native.h)
+            return doc:renderPage(page, nil, zoom, 0, 1.0, 1.0)
+        end)
+        if ok and tile and tile.bb then
+            return tile.bb, false -- owned by KOReader's page cache: never free it
+        end
+        logger.info("splitread: renderPage failed, capturing the screen instead:", tostring(tile))
+    end
+
+    local width = Screen:getWidth()
+    local height = Screen:getHeight() - self.panel_height - self:getFooterHeight()
+    local crop = Blitbuffer.new(width, height, Screen.bb:getType())
+    crop:blitFrom(Screen.bb, 0, 0, 0, 0, width, height)
+    return crop, true
+end
+
+-- The current page as { data = <base64>, mime = <type> }, or nil, error.
+function splitread:getPageImage(page)
+    local DataStorage = require("datastorage")
+    local lfs = require("libs/libkoreader-lfs")
+    local mime = require("mime")
+
+    local ok_bb, bb, owned = pcall(function() return self:capturePageBB(page) end)
+    if not ok_bb or not bb then
+        return nil, "Could not capture the page image."
+    end
+
+    local dir = DataStorage:getDataDir() .. "/cache"
+    lfs.mkdir(dir) -- harmless if it already exists
+    local path = dir .. "/splitread_page.tmp"
+
+    local mime_type
+    if pcall(function() bb:writeJPG(path, IMAGE_JPEG_QUALITY) end) then
+        mime_type = "image/jpeg"
+    elseif pcall(function() bb:writePNG(path) end) then
+        mime_type = "image/png"
+    end
+    if owned then bb:free() end
+    if not mime_type then
+        return nil, "Could not encode the page image."
+    end
+
+    local f = io.open(path, "rb")
+    local data = f and f:read("*a")
+    if f then f:close() end
+    os.remove(path)
+    if not data or #data == 0 then
+        return nil, "Could not read back the page image."
+    end
+
+    logger.info("splitread: page image", mime_type, #data, "bytes")
+    return { data = (mime.b64(data)), mime = mime_type }
+end
+
+-- `force` skips the cache (used by "Translate this page now").
+function splitread:translateCurrentPage(force)
+    local provider = self.config.provider or "google"
+    local mode = self.config.page_input or "auto"
+
+    if not Translator:isNetworkAvailable(provider, self.config.local_url) then
+        self.panel_text = "No internet connection."
+        self:refreshPanel()
+        return
+    end
+
+    local current_page = self.ui:getCurrentPage()
+
+    local current
+    if mode ~= "image" then
+        current = self:getTextForPage(current_page)
+    end
+
+    -- Page image (OCR) instead of page text: always in "image" mode, and in
+    -- "auto" mode when the page has no text (scanned PDF, comic, ...) and the
+    -- provider can read images.
+    local compact = current and current:gsub("%s", "") or ""
+    local use_image = mode == "image"
+        or (mode == "auto" and provider == "local" and #compact < MIN_TEXT_CHARS)
+
+    if use_image then
+        if provider ~= "local" then
+            self.panel_text = "Page images can only be read by the Local LLM provider. "
+                .. "Choose it in Settings > Provider."
+            self:refreshPanel()
+            return
+        end
+        local key = self:getCacheKey(current_page, "image")
+        if self:showCachedTranslation(key, force) then return end
+        self.panel_text = "Preparing the page image..."
+        self:refreshPanel()
+        local image, err = self:getPageImage(current_page)
+        if not image then
+            self.panel_text = "Error: " .. tostring(err)
+            self:refreshPanel()
+            return
+        end
+        self:runTranslation(key, nil, image)
+        return
+    end
+
+    if not current or #current == 0 then
+        self.panel_text = "No text found. (Image-only pages can be read by the Local LLM provider.)"
+        self:refreshPanel()
+        return
+    end
+
+    local final_text = self:stitchPageText(current_page, current)
+    if #final_text == 0 then
+        self.panel_text = "No complete sentences found."
+        self:refreshPanel()
+        return
+    end
+
+    local key = self:getCacheKey(current_page, "text")
+    if self:showCachedTranslation(key, force) then return end
+    self:runTranslation(key, final_text, nil)
+end
+
+function splitread:scheduleTranslation()
+    UIManager:unschedule(self.translate_task)
+    UIManager:scheduleIn(0.5, self.translate_task)
+end
+
 function splitread:onPageUpdate(pageno)
     if not self:isEnabledForBook() then return end
     if not self.config.auto_translate then return end
-    UIManager:scheduleIn(0.5, function() self:translateCurrentPage() end)
+    self:scheduleTranslation()
 end
 
 function splitread:onPosUpdate(pos, pageno)
     if not self:isEnabledForBook() then return end
     if not self.config.auto_translate then return end
-    UIManager:scheduleIn(0.5, function() self:translateCurrentPage() end)
+    self:scheduleTranslation()
 end
 
 function splitread:getPanelGearRegion()
@@ -314,6 +528,12 @@ function splitread:showSettingsDialog()
             self:refreshPanel()
         end,
         function(new_ratio)
+        end,
+        function()
+            -- Let the dialog close and the page repaint before a slow request.
+            UIManager:scheduleIn(0.3, function()
+                if self:isEnabledForBook() then self:translateCurrentPage(true) end
+            end)
         end
     )
 end
@@ -383,6 +603,10 @@ function splitread:addToMainMenu(menu_items)
                         self.view.dimen.h = Screen:getHeight()
                         self.ui.dimen.h = Screen:getHeight()
                         self.ui:handleEvent(Event:new("SetDimensions", self.ui.dimen))
+                        if self.ui.paging then
+                            -- Re-zoom the page to the full screen again.
+                            self.ui:handleEvent(Event:new("RedrawCurrentPage"))
+                        end
                         Screen.bb:paintRect(0, Screen:getHeight() - self.panel_height,
                             Screen:getWidth(), self.panel_height, Blitbuffer.COLOR_WHITE)
                         Screen:refreshUI(0, Screen:getHeight() - self.panel_height,

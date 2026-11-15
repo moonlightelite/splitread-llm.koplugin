@@ -1,3 +1,8 @@
 return {
     gemini = "your-gemini-api-key-here",
+
+    -- Optional. Only needed if your local OpenAI-compatible server requires a key
+    -- (e.g. `vllm serve --api-key ...` or `llama-server --api-key ...`).
+    -- Leave it out otherwise.
+    local_llm = "your-local-llm-api-key-here",
 }
