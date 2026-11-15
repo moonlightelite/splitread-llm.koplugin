@@ -183,6 +183,11 @@ end
 -- (vLLM, llama.cpp `llama-server`, Ollama, LM Studio, ...)
 ------------------------------------------------------------------------------
 
+-- Bumped whenever the way the local prompt is built changes in a way that can
+-- change the answers; it is part of the cache key, so translations made with an
+-- older prompt are not served any more.
+Translator.PROMPT_VERSION = 2
+
 local LOCAL_TEMPERATURE = 0.2
 local MODELS_TIMEOUT = 10
 local DEFAULT_LOCAL_TIMEOUT = 180
@@ -441,7 +446,13 @@ function Translator:translateLocal(text, source_lang, target_lang, opts)
     local messages = {}
     local system_prompt = trim(toValidUTF8(cfg.local_system_prompt or ""))
     if system_prompt ~= "" then
-        table.insert(messages, { role = "system", content = fillPrompt(system_prompt, source_name, target_name) })
+        -- The target language is stated again after the (possibly custom) prompt:
+        -- a prompt that names a language ("... into Simplified Chinese") would
+        -- otherwise win over the target setting, and every page came out in it.
+        local content = fillPrompt(system_prompt, source_name, target_name)
+            .. string.format("\n\nThe target language is %s. Always translate into %s, whatever language is named above.",
+                target_name, target_name)
+        table.insert(messages, { role = "system", content = content })
     end
     table.insert(messages, { role = "user", content = user_content })
 

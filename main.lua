@@ -299,7 +299,8 @@ function splitread:getCachePrefix(kind)
         -- Without a configured model the server picks one: tell servers apart then.
         local model = c.local_model or ""
         if model == "" then model = "auto@" .. tostring(c.local_url) end
-        table.insert(parts, TranslationCache.hash(model .. "\0" .. tostring(c.local_system_prompt)))
+        table.insert(parts, TranslationCache.hash(model .. "\0" .. tostring(c.local_system_prompt)
+            .. "\0" .. tostring(Translator.PROMPT_VERSION)))
     end
     return table.concat(parts, KEY_SEP)
 end
