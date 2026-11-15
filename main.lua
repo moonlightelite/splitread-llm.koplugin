@@ -16,6 +16,7 @@ local Translator = require("translator")
 local UI = require("ui_splitread")
 local TranslationCache = require("translation_cache")
 local Sentences = require("sentences")
+local TextFormat = require("textformat")
 
 local splitread = InputContainer:extend{
     name = "splitread",
@@ -326,11 +327,11 @@ end
 -- Shows the cached translation for `key`, if any. Returns true when it did.
 -- `force` ("Translate this page now") ignores the cache; the new result then
 -- replaces the old entry.
-function splitread:showCachedTranslation(key, force)
+function splitread:showCachedTranslation(key, force, source)
     if force then return false end
     local cached = self:getTranslationCache():get(self.config.target_lang, key)
     if not cached then return false end
-    self.panel_text = cached
+    self.panel_text = TextFormat.translation(cached, source)
     self:refreshPanel()
     self:schedulePrefetch()
     return true
@@ -368,8 +369,9 @@ function splitread:runTranslation(key, text, image)
     if err then
         self.panel_text = "Error: " .. err
     elseif translated and translated ~= "" then
-        self.panel_text = translated
-        self:getTranslationCache():put(self.config.target_lang, key, translated)
+        -- (blank lines between paragraphs are dropped unless the source has them)
+        self.panel_text = TextFormat.translation(translated, text)
+        self:getTranslationCache():put(self.config.target_lang, key, self.panel_text)
         self:schedulePrefetch()
     else
         self.panel_text = "Empty translation."
@@ -493,7 +495,7 @@ function splitread:translateCurrentPage(force)
 
     -- A cached translation needs no connection: the network is only checked
     -- once a request has to be made.
-    if self:showCachedTranslation(plan.key, force) then return end
+    if self:showCachedTranslation(plan.key, force, plan.text) then return end
     -- The page is being translated in the background already: wait for that.
     if not force and self:waitForPrefetch(plan.key) then return end
     if not self:hasConnection() then return end
@@ -614,7 +616,7 @@ function splitread:startPrefetchJob(plan)
     end
 
     local timeout = tonumber(cfg.local_timeout) or 180
-    self.prefetch_job = { pid = pid, fd = fd, key = plan.key, lang = target, page = plan.page, deadline = os.time() + timeout + 20 }
+    self.prefetch_job = { pid = pid, fd = fd, key = plan.key, lang = target, page = plan.page, source = plan.text, deadline = os.time() + timeout + 20 }
     logger.info("splitread: pre-translating page", plan.page)
     UIManager:scheduleIn(PREFETCH_POLL, self.prefetch_poll_task)
 end
@@ -640,6 +642,7 @@ function splitread:prefetchPoll()
     local status, body = (data or ""):match("^(%u+)\n(.*)$")
     if status == "OK" and body and body ~= "" then
         -- stored under the language it was asked for, even if the setting changed meanwhile
+        body = TextFormat.translation(body, job.source)
         self:getTranslationCache():put(job.lang, job.key, body)
         if self.waiting_key == job.key then
             self.waiting_key = nil

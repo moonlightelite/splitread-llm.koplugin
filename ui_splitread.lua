@@ -59,6 +59,11 @@ function UI:getLanguageName(code)
     return code:upper()
 end
 
+-- "1 page", "2 pages"
+local function pages(n)
+    return n .. (n == 1 and " page" or " pages")
+end
+
 function UI:getPrefetchName(n)
     n = tonumber(n) or 0
     if n <= 0 then return "off" end
@@ -531,7 +536,7 @@ function UI:showCacheDialog(cache, on_done, config, Config)
         add("Nothing saved for this book yet")
     end
     for _, code in ipairs(codes) do
-        add(string.format("Clear %s (%d pages)", label(code), counts[code]), function()
+        add(string.format("Clear %s (%s)", label(code), pages(counts[code])), function()
             cache:clearLanguage(code)
         end)
     end
@@ -548,7 +553,7 @@ function UI:showCacheDialog(cache, on_done, config, Config)
         })
     end
     if cache:count() > 0 then
-        add_confirmed(string.format("Clear this book (%d pages)…", cache:count()), "book")
+        add_confirmed(string.format("Clear this book (%s)…", pages(cache:count())), "book")
     end
     add_confirmed("Clear the cache of every book…", "all")
     table.insert(buttons, {
@@ -827,7 +832,7 @@ function UI:showSettingsDialog(config, Config, on_refresh, on_panel_resize, on_t
                 },
                 {
                     {
-                        text = "Translation cache: " .. (self.translation_cache and self.translation_cache:count() or 0) .. " pages saved",
+                        text = "Translation cache: " .. pages(self.translation_cache and self.translation_cache:count() or 0) .. " saved",
                         callback = function()
                             if not self.translation_cache then return end
                             UIManager:close(dialog)
