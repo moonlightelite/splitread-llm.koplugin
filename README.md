@@ -6,9 +6,19 @@ A KOReader plugin that displays real-time translations in a split panel, designe
 
 ## Screenshots
 
-| Reading View | Settings |
+![splitread demo: a page is translated, the next pages are pre-translated in the background, the target language is switched](screenshots/demo.gif)
+
+*Demo (41 s, [full quality MP4](screenshots/demo.mp4)): a French story translated by a local LLM; **Pre-translate** is switched on and translates the next pages in the background while the reader stays usable; then the target language is changed to Traditional Chinese. Where the video says "sped up", the waiting for the LLM was shortened.*
+
+| Reading View | Traditional Chinese | Settings |
+|---|---|---|
+| ![Reading View](screenshots/readingview.png) | ![Reading View, translated into Traditional Chinese](screenshots/readingview-zh.png) | ![Settings](screenshots/settings.png) |
+
+| Local LLM settings | Translation cache |
 |---|---|
-| ![Reading View](screenshots/readingview.png) | ![Settings](screenshots/settings.png) |
+| ![Local LLM settings](screenshots/local-llm.png) | ![Translation cache](screenshots/cache.png) |
+
+*A French demo story (original text, written for these screenshots) translated by a local LLM. Look at the translation of the page: it starts with the beginning of the sentence that began on the previous page, and ends with the sentence that continues on the next one. The server address and model in the Local LLM settings are examples.*
 
 ---
 
@@ -17,6 +27,8 @@ A KOReader plugin that displays real-time translations in a split panel, designe
 Splitread divides your reading screen into two halves:
 - **Top** - the original text, as normal
 - **Bottom** - a live translation of the visible page, updating automatically as you turn pages
+
+The translation is tidied before it is shown: the blank lines that models like to put between paragraphs are removed (unless the page text itself has blank lines), so the panel does not waste vertical space.
 
 Translation is powered by KOReader's built-in Google Translate integration by default - no API key required. You can also use Gemini, or your own **local LLM** (any OpenAI-compatible server such as vLLM or llama.cpp), which can even read scanned or image-only pages (see [Using a local LLM](#using-a-local-llm)). An active network connection is needed for translations to work.
 
