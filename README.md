@@ -1,4 +1,7 @@
-# splitread - Translation Panel for KOReader
+# splitread-llm - Translation Panel for KOReader with support for local LLM
+
+
+
 
 A KOReader plugin that displays real-time translations in a split panel, designed for language learners reading foreign-language books.
 
@@ -19,6 +22,11 @@ A KOReader plugin that displays real-time translations in a split panel, designe
 | ![Local LLM settings](screenshots/local-llm.png) | ![Translation cache](screenshots/cache.png) |
 
 *A French demo story (original text, written for these screenshots) translated by a local LLM. Look at the translation of the page: it starts with the beginning of the sentence that began on the previous page, and ends with the sentence that continues on the next one. The server address and model in the Local LLM settings are examples.*
+
+
+
+https://github.com/user-attachments/assets/3636bc00-440d-4559-9294-9d2342225523
+
 
 ---
 
@@ -190,7 +198,7 @@ The Gemini translation provider is now ready to use.
 
 ## Tested On
 
-- Kobo Libra H2O
+- Kindle Scribe 
 - Linux (KOReader AppImage)
 
 ---
