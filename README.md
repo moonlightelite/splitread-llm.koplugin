@@ -52,8 +52,8 @@ It works best for readers who:
 
 ## Installation
 
-1. Download the latest release from the [releases page](https://github.com/sadatdaniel/splitread.koplugin/releases) or clone this repository.
-2. Copy the `splitread.koplugin` folder to your KOReader plugins directory:
+1. Download the latest release from the [releases page](https://github.com/moonlightelite/splitread-llm.koplugin/releases) or clone this repository.
+2. Copy the `splitread-llm.koplugin` folder to your KOReader plugins directory:
    - **Kobo/Kindle:** `koreader/plugins/`
    - **Android:** `/sdcard/koreader/plugins/`
    - **Desktop (Linux):** `~/.config/koreader/plugins/`
